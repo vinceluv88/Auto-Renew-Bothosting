@@ -1,313 +1,146 @@
-```python
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import re
-import sys
 import time
 import subprocess
-import requests
-
 from datetime import datetime, timezone, timedelta
+
+import requests
 from seleniumbase import SB
 
 
 # ============================================================
-# 环境变量
+# 配置
 # ============================================================
 
 EMAIL = os.environ.get("EMAIL", "").strip()
-
-# Bot-hosting SESSION token
 SESSION_TOKEN = os.environ.get("SESSION_TOKEN", "").strip()
 
-# GitHub PAT，用于自动更新 SESSION_TOKEN
 GH_TOKEN = os.environ.get("GH_TOKEN", "").strip()
 
-# Telegram
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 
-# Proxy
 IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
-PROXY_SERVER = (
-    os.environ.get("PROXY_SERVER", "").strip()
-    or "http://127.0.0.1:1080"
-)
+PROXY_SERVER = os.environ.get("PROXY_SERVER", "").strip()
 
-# 浏览器
-HEADLESS = os.environ.get("HEADLESS", "false").lower() == "true"
+HEADLESS = os.environ.get("HEADLESS", "true").lower() == "true"
 
+BASE_URL = "https://bot-hosting.net/"
+BILLING_URL = "https://bot-hosting.net/a/billings"
 
-# ============================================================
-# 基本检查
-# ============================================================
+# GitHub Actions 仓库中保存的 Secret 名称
+SESSION_SECRET_NAME = "SESSION_TOKEN"
 
-if not SESSION_TOKEN:
-    print("❌ 未配置 SESSION_TOKEN")
-    print("请在 GitHub Secrets / 环境变量中设置 SESSION_TOKEN")
-    sys.exit(1)
-
-
-# ============================================================
-# 全局状态
-# ============================================================
-
-LOGIN_METHOD = "SESSION_TOKEN"
-
-
-# ============================================================
-# 时间
-# ============================================================
-
+# Singapore / UTC+8
 UTC8 = timezone(timedelta(hours=8))
 
 
-def now_local():
-    return datetime.now(UTC8)
-
-
-def now_string():
-    return now_local().strftime("%Y-%m-%d %H:%M:%S")
-
-
 # ============================================================
-# Telegram
+# 基础工具
 # ============================================================
 
-def send_telegram_message(message: str):
-    if not TG_BOT_TOKEN or not TG_CHAT_ID:
-        print("⚠️ Telegram 未配置，跳过通知")
-        return False
-
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TG_BOT_TOKEN}/sendMessage"
-    )
-
-    try:
-        response = requests.post(
-            url,
-            json={
-                "chat_id": TG_CHAT_ID,
-                "text": message,
-            },
-            timeout=10,
-        )
-
-        if response.ok:
-            print("✅ Telegram 通知已发送")
-            return True
-
-        print(
-            f"❌ Telegram HTTP {response.status_code}: "
-            f"{response.text[:300]}"
-        )
-        return False
-
-    except Exception as e:
-        print(f"❌ Telegram 发送失败: {e}")
-        return False
+def log(message):
+    now = datetime.now(UTC8).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] {message}", flush=True)
 
 
-# ============================================================
-# 邮箱脱敏
-# ============================================================
-
-def mask_email(email: str) -> str:
+def mask_email(email):
     if not email:
         return "****"
 
     if "@" not in email:
-        return email[:2] + "****"
+        return "****"
 
     name, domain = email.split("@", 1)
 
-    if len(name) <= 4:
-        return f"{name}@{domain}"
+    if len(name) <= 2:
+        masked = name[0] + "*" * max(1, len(name) - 1)
+    else:
+        masked = name[0] + "*" * (len(name) - 2) + name[-1]
 
-    return f"{name[:2]}****{name[-2:]}@{domain}"
+    return masked + "@" + domain
 
 
-# ============================================================
-# Telegram 通知格式
-# ============================================================
-
-def format_notification(
-    status: str,
-    extra: str = "",
-    error: str = "",
-    expiry_date: str = "",
-) -> str:
-
-    lines = [
-        "🇫🇮 Bot-hosting 续期通知",
-        "",
-        status,
-        f"👤 登录账户: {mask_email(EMAIL)}",
+def get_current_ip():
+    services = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
     ]
 
-    if LOGIN_METHOD != "SESSION_TOKEN":
-        lines.append(f"🔐 登录方式: {LOGIN_METHOD}")
+    for url in services:
+        try:
+            response = requests.get(url, timeout=8)
+            if response.ok:
+                ip = response.text.strip()
+                if ip:
+                    return ip
+        except Exception:
+            pass
+
+    return "未知"
+
+
+# ============================================================
+# Telegram
+# ============================================================
+
+def send_telegram_message(text):
+    if not TG_BOT_TOKEN or not TG_CHAT_ID:
+        log("ℹ️ 未配置 Telegram，跳过通知")
+        return False
+
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+    }
+
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=15,
+        )
+
+        if response.ok:
+            log("✅ Telegram 通知已发送")
+            return True
+
+        log(f"⚠️ Telegram 返回异常: {response.status_code}")
+        return False
+
+    except Exception as e:
+        log(f"⚠️ Telegram 发送失败: {e}")
+        return False
+
+
+def format_notification(
+    title,
+    expiry_date=None,
+    extra=None,
+    error=None,
+):
+    lines = [
+        f"🇫🇮 Bot-hosting 续期通知",
+        "",
+        title,
+        f"👤 登录账户: {mask_email(EMAIL)}",
+    ]
 
     if expiry_date:
         lines.append(f"📅 到期时间: {expiry_date}")
 
     if extra:
-        lines.append(extra)
+        lines.append(str(extra))
 
     if error:
-        lines.append(f"⚠️ 错误信息: {error}")
+        lines.append(f"❌ 错误: {error}")
 
-    lines.append(f"⏱️ 登录时间: {now_string()}")
+    local_time = datetime.now(UTC8).strftime("%Y-%m-%d %H:%M:%S")
+    lines.append(f"⏱️ 登录时间: {local_time}")
 
     return "\n".join(lines)
-
-
-# ============================================================
-# 获取出口 IP
-# ============================================================
-
-def get_current_ip(proxy_server: str = "") -> str:
-    proxies = None
-
-    if proxy_server:
-        proxies = {
-            "http": proxy_server,
-            "https": proxy_server,
-        }
-
-    response = requests.get(
-        "https://api.ip.sb/ip",
-        proxies=proxies,
-        timeout=15,
-    )
-
-    response.raise_for_status()
-
-    return response.text.strip()
-
-
-# ============================================================
-# Cookie
-# ============================================================
-
-def get_cookie_info(sb, name):
-    try:
-        cookies = sb.get_cookies()
-    except Exception as e:
-        print(f"⚠️ 获取 Cookie 失败: {e}")
-        return None, None
-
-    for cookie in cookies:
-        if cookie.get("name") != name:
-            continue
-
-        value = cookie.get("value")
-        expiry_ts = cookie.get("expiry")
-
-        expiry_dt = None
-
-        if expiry_ts:
-            try:
-                expiry_dt = datetime.fromtimestamp(
-                    expiry_ts,
-                    tz=timezone.utc,
-                )
-            except Exception:
-                expiry_dt = None
-
-        return value, expiry_dt
-
-    return None, None
-
-
-def should_update_cookie(
-    new_value,
-    old_value,
-    expiry_dt,
-    days_threshold=3,
-):
-    if not new_value:
-        return False
-
-    if new_value != old_value:
-        return True
-
-    if expiry_dt:
-        remaining = (
-            expiry_dt - datetime.now(timezone.utc)
-        ).total_seconds()
-
-        if remaining < days_threshold * 24 * 3600:
-            return True
-
-    return False
-
-
-# ============================================================
-# GitHub Secret
-# ============================================================
-
-def update_github_secret(secret_name, new_value):
-    if not new_value:
-        print(
-            f"⚠️ 跳过更新 {secret_name}: "
-            "新值为空"
-        )
-        return False
-
-    masked = (
-        new_value[:4] + "..." + new_value[-4:]
-        if len(new_value) > 8
-        else "***"
-    )
-
-    print(
-        f"🔄 更新 GitHub Secret: "
-        f"{secret_name} ({masked})"
-    )
-
-    try:
-        env = os.environ.copy()
-
-        if GH_TOKEN:
-            env["GH_TOKEN"] = GH_TOKEN
-
-        proc = subprocess.run(
-            [
-                "gh",
-                "secret",
-                "set",
-                secret_name,
-                "--body",
-                new_value,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-            env=env,
-        )
-
-        if proc.returncode == 0:
-            print(
-                f"✅ GitHub Secret {secret_name} "
-                "更新成功"
-            )
-            return True
-
-        print(
-            f"❌ GitHub Secret 更新失败: "
-            f"{proc.stderr.strip()}"
-        )
-
-        return False
-
-    except Exception as e:
-        print(f"❌ GitHub Secret 更新异常: {e}")
-        return False
 
 
 # ============================================================
@@ -323,62 +156,71 @@ def parse_expiry_date(value):
     formats = [
         "%Y/%m/%d",
         "%Y-%m-%d",
+        "%Y.%m.%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
         "%m/%d/%Y",
         "%m-%d-%Y",
     ]
 
     for fmt in formats:
         try:
-            return datetime.strptime(
-                value,
-                fmt,
-            ).date()
+            return datetime.strptime(value, fmt).date()
         except ValueError:
-            pass
+            continue
 
     return None
 
 
-def extract_expiry_date(page_source: str):
+def extract_expiry_date(page_source):
     if not page_source:
         return None
 
+    # 先处理常见的 Expires 格式
     patterns = [
-        # Expires: 2026/09/04
         r"Expires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})",
-
-        # Expires: 2026-09-04
         r"Expires\s*[:\-]?\s*(\d{4}-\d{2}-\d{2})",
-
-        # Expires: 09/04/2026
         r"Expires\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
+        r"Expires\s*[:\-]?\s*(\d{2}-\d{2}-\d{4})",
 
-        # 2026/09/04 - renew
-        r"(\d{4}/\d{2}/\d{2})\s*[-–]\s*renew",
-
-        # 2026-09-04 - renew
-        r"(\d{4}-\d{2}-\d{2})\s*[-–]\s*renew",
-
-        # 09/04/2026 - renew
-        r"(\d{2}/\d{2}/\d{4})\s*[-–]\s*renew",
+        r"expires\s*[:\-]?\s*(\d{4}/\d{2}/\d{2})",
+        r"expires\s*[:\-]?\s*(\d{4}-\d{2}-\d{2})",
+        r"expires\s*[:\-]?\s*(\d{2}/\d{2}/\d{4})",
+        r"expires\s*[:\-]?\s*(\d{2}-\d{2}-\d{4})",
     ]
 
     for pattern in patterns:
-        match = re.search(
-            pattern,
-            page_source,
-            re.IGNORECASE,
-        )
+        match = re.search(pattern, page_source, re.I)
 
-        if not match:
-            continue
+        if match:
+            return match.group(1)
 
-        date_str = match.group(1)
+    # 处理类似：
+    # 2026/09/04 - renew
+    patterns = [
+        r"(\d{4}/\d{2}/\d{2})\s*[\-–—]\s*renew",
+        r"(\d{4}-\d{2}-\d{2})\s*[\-–—]\s*renew",
+        r"(\d{2}/\d{2}/\d{4})\s*[\-–—]\s*renew",
+        r"(\d{2}-\d{2}-\d{4})\s*[\-–—]\s*renew",
+    ]
 
-        parsed = parse_expiry_date(date_str)
+    for pattern in patterns:
+        match = re.search(pattern, page_source, re.I)
 
-        if parsed:
-            return parsed.strftime("%Y/%m/%d")
+        if match:
+            return match.group(1)
+
+    # 最后寻找页面中可能出现的日期
+    generic_patterns = [
+        r"\b(20\d{2}/\d{2}/\d{2})\b",
+        r"\b(20\d{2}-\d{2}-\d{2})\b",
+    ]
+
+    for pattern in generic_patterns:
+        match = re.search(pattern, page_source)
+
+        if match:
+            return match.group(1)
 
     return None
 
@@ -387,7 +229,7 @@ def extract_expiry_date(page_source: str):
 # 倒计时
 # ============================================================
 
-def extract_countdown(page_source: str):
+def extract_countdown(page_source):
     if not page_source:
         return None
 
@@ -397,11 +239,7 @@ def extract_countdown(page_source: str):
     ]
 
     for pattern in patterns:
-        match = re.search(
-            pattern,
-            page_source,
-            re.IGNORECASE,
-        )
+        match = re.search(pattern, page_source, re.I)
 
         if match:
             return match.group(1)
@@ -409,115 +247,104 @@ def extract_countdown(page_source: str):
     return None
 
 
-def format_countdown(countdown):
-    if not countdown:
-        return ""
-
-    try:
-        h, m, s = countdown.split(":")
-        h = int(h)
-        m = int(m)
-
-        if h > 0:
-            return f"{h}h{m}min"
-
-        return f"{m}min"
-
-    except Exception:
-        return countdown
-
-
 # ============================================================
 # 页面诊断
 # ============================================================
 
-def get_page_diagnostic(sb, max_length=600):
+def get_page_diagnostic(sb):
     try:
         text = sb.get_text("body")
-    except Exception:
-        return ""
 
-    text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return ""
 
-    if len(text) > max_length:
-        text = text[:max_length] + "..."
+        text = re.sub(r"\s+", " ", text).strip()
 
-    return text
+        return text[:1000]
+
+    except Exception as e:
+        return f"无法读取页面: {e}"
 
 
 # ============================================================
-# 登录
+# Session Cookie
+# ============================================================
+
+def inject_session_cookie(sb):
+    if not SESSION_TOKEN:
+        log("❌ SESSION_TOKEN 未配置")
+        return False
+
+    try:
+        sb.open(BASE_URL)
+
+        sb.add_cookie(
+            {
+                "name": "session_token",
+                "value": SESSION_TOKEN,
+                "path": "/",
+                "secure": True,
+            }
+        )
+
+        sb.add_cookie(
+            {
+                "name": "login",
+                "value": "true",
+                "path": "/",
+            }
+        )
+
+        sb.add_cookie(
+            {
+                "name": "theme",
+                "value": "system",
+                "path": "/",
+            }
+        )
+
+        log("✅ Session Cookie 已注入")
+        return True
+
+    except Exception as e:
+        log(f"❌ 注入 Session Cookie 失败: {e}")
+        return False
+
+
+# ============================================================
+# 登录检查
 # ============================================================
 
 def login_with_session(sb):
-    print("🚀 使用 SESSION_TOKEN 登录...")
-
     try:
-        sb.open("https://bot-hosting.net/")
-        sb.wait_for_ready_state_complete()
-        sb.sleep(2)
-
-        print("📝 注入 SESSION_TOKEN Cookie...")
-
-        cookies = {
-            "session_token": SESSION_TOKEN,
-            "login": "true",
-            "theme": "system",
-        }
-
-        for name, value in cookies.items():
-            if not value:
-                continue
-
-            sb.add_cookie(
-                {
-                    "name": name,
-                    "value": value,
-                    "domain": "bot-hosting.net",
-                }
-            )
-
-        print(
-            "🌐 打开 "
-            "https://bot-hosting.net/a/billings"
-        )
-
-        sb.open(
-            "https://bot-hosting.net/a/billings"
-        )
-
-        sb.wait_for_ready_state_complete()
-        sb.sleep(3)
+        sb.open(BILLING_URL)
+        sb.sleep(5)
 
         current_url = sb.get_current_url()
-        current_title = sb.get_title()
 
-        print(f"📝 当前 URL: {current_url}")
-        print(f"📝 当前 Title: {current_title}")
+        log(f"🌐 当前 URL: {current_url}")
 
-        if (
-            "/a/billings" in current_url
-            and "/login" not in current_url
-            and "error=" not in current_url
-        ):
-            print(
-                "✅ SESSION_TOKEN 登录成功"
-            )
+        if "/a/billings" in current_url and "/login" not in current_url:
+            log("✅ Session 登录成功")
             return True
 
-        print(
-            "❌ SESSION_TOKEN 登录失败"
-        )
+        if "error=" in current_url.lower():
+            log("❌ URL 中发现登录错误")
+
+        diagnostic = get_page_diagnostic(sb)
+
+        if diagnostic:
+            log(f"页面信息: {diagnostic[:500]}")
 
         return False
 
     except Exception as e:
-        print(f"❌ 登录异常: {e}")
+        log(f"❌ 登录检查失败: {e}")
         return False
 
 
 # ============================================================
-# 找 Renew 按钮
+# 查找外部续期按钮
 # ============================================================
 
 def find_renew_control(sb):
@@ -527,91 +354,73 @@ def find_renew_control(sb):
         'a:contains("Renew free plan")',
         'a:contains("Renew")',
         '[class*="renew"]',
+        '[class*="Renew"]',
     ]
-
-    countdown = None
 
     for selector in selectors:
         try:
-            if not sb.is_element_visible(selector):
-                continue
+            if sb.is_element_visible(selector):
+                text = sb.get_text(selector).strip()
 
-            text = sb.get_text(selector).strip()
+                if text:
+                    log(f"🔎 找到续期控件: {text[:150]}")
 
-            if not text:
-                continue
-
-            print(
-                f"🔎 找到候选元素: "
-                f"{text[:150]!r}"
-            )
-
-            countdown_match = re.search(
-                r"Renew\s+in\s+(\d{2}:\d{2}:\d{2})",
-                text,
-                re.IGNORECASE,
-            )
-
-            if countdown_match:
-                countdown = countdown_match.group(1)
-                continue
-
-            if "renew" in text.lower():
-                return selector, countdown
+                return selector
 
         except Exception:
             continue
 
-    return None, countdown
+    return None
 
 
 # ============================================================
-# 等待验证/人工操作完成
+# 等待验证页面结束
 # ============================================================
 
 def wait_for_verification(sb, timeout=120):
     """
     不自动绕过 CAPTCHA / Turnstile。
-    如果页面需要人工验证，则等待验证完成。
+    如果页面出现验证，则等待页面自行完成验证。
     """
 
-    print(
-        "🔒 如果页面出现验证，请在浏览器中完成验证。"
-    )
+    indicators = [
+        "verify you are human",
+        "确认您是真人",
+        "just a moment",
+        "checking your browser",
+        "checking your connection",
+        "cf-chl",
+    ]
 
-    deadline = time.time() + timeout
+    start = time.time()
 
-    while time.time() < deadline:
+    log("🛡️ 检查页面验证状态...")
+
+    while time.time() - start < timeout:
         try:
             source = sb.get_page_source().lower()
 
-            indicators = [
-                "verify you are human",
-                "确认您是真人",
-                "just a moment",
-                "turnstile",
-            ]
+            found = False
 
-            has_verification = any(
-                item in source
-                for item in indicators
-            )
+            for indicator in indicators:
+                if indicator in source:
+                    found = True
+                    break
 
-            if not has_verification:
-                print(
-                    "✅ 页面验证状态已离开验证页"
-                )
+            if not found:
+                log("✅ 未检测到正在进行的验证页面")
                 return True
 
-        except Exception:
-            pass
+            elapsed = int(time.time() - start)
 
-        sb.sleep(2)
+            log(f"⏳ 页面仍在验证中... {elapsed}/{timeout}s")
 
-    print(
-        f"❌ 等待验证超过 {timeout} 秒"
-    )
+        except Exception as e:
+            log(f"⚠️ 检查验证状态失败: {e}")
 
+        sb.sleep(3)
+
+    log("⚠️ 验证等待超时")
     return False
 
 
@@ -620,30 +429,27 @@ def wait_for_verification(sb, timeout=120):
 # ============================================================
 
 def click_outer_renew(sb, selector):
-    print("🔄 点击外部 Renew 按钮...")
-
     try:
+        log(f"🖱️ 点击续期控件: {selector}")
+
         sb.click(
             selector,
             timeout=10,
         )
 
-        print("✅ 外部 Renew 已点击")
+        sb.sleep(5)
 
-        # 给弹窗/页面足够时间加载
-        sb.sleep(3)
+        log("✅ 外部续期控件点击完成")
 
         return True
 
     except Exception as e:
-        print(
-            f"❌ 外部 Renew 点击失败: {e}"
-        )
+        log(f"❌ 外部续期控件点击失败: {e}")
         return False
 
 
 # ============================================================
-# 点击最终 Renew
+# 点击最终 Renew for 4 days
 # ============================================================
 
 def click_final_renew(sb):
@@ -654,599 +460,501 @@ def click_final_renew(sb):
 
     for selector in selectors:
         try:
-            if not sb.is_element_visible(selector):
-                continue
+            if sb.is_element_visible(selector):
+                text = sb.get_text(selector).strip()
 
-            text = sb.get_text(selector).strip()
+                log(f"🔎 找到最终续期按钮: {text[:150]}")
 
-            if "renew" not in text.lower():
-                continue
+                sb.click(
+                    selector,
+                    timeout=10,
+                )
 
-            print(
-                f"🔘 尝试点击最终按钮: "
-                f"{text[:150]!r}"
-            )
+                log("✅ 已点击最终续期按钮")
 
-            sb.click(
-                selector,
-                timeout=10,
-            )
-
-            print("✅ 已点击最终 Renew 按钮")
-
-            return True
+                return True
 
         except Exception as e:
-            print(
-                f"⚠️ 点击 {selector} 失败: {e}"
-            )
+            log(f"⚠️ 尝试按钮失败 {selector}: {e}")
+
+    log("❌ 找不到最终续期按钮")
 
     return False
 
 
 # ============================================================
-# 确认续期结果
+# 验证续期结果
 # ============================================================
 
-def verify_renewal(
-    sb,
-    old_expiry,
-    timeout=45,
-):
-    """
-    核心逻辑：
+def verify_renewal(sb, old_expiry, timeout=45):
+    old_date = parse_expiry_date(old_expiry)
 
-    只有确认新的到期日期 > 旧日期，
-    才认为续期成功。
-
-    Renew in 倒计时只作为辅助信息。
-    """
-
-    old_date = parse_expiry_date(
-        old_expiry
-    )
+    if not old_date:
+        log("⚠️ 原到期日期无法解析")
 
     deadline = time.time() + timeout
 
     last_expiry = None
     last_countdown = None
 
-    print(
-        f"🔍 开始确认续期结果，"
-        f"旧到期日期: {old_expiry}"
-    )
+    log(f"🔍 开始检查续期结果，最多等待 {timeout} 秒")
 
     while time.time() < deadline:
-
         try:
             source = sb.get_page_source()
 
-            last_expiry = extract_expiry_date(
-                source
-            )
+            current_expiry = extract_expiry_date(source)
 
-            last_countdown = extract_countdown(
-                source
-            )
+            if current_expiry:
+                last_expiry = current_expiry
 
-            print(
-                f"🔎 当前状态: "
-                f"expiry={last_expiry}, "
-                f"countdown={last_countdown}"
-            )
+            current_countdown = extract_countdown(source)
 
-            # ----------------------------------------
-            # 最可靠判断：新日期 > 旧日期
-            # ----------------------------------------
+            if current_countdown:
+                last_countdown = current_countdown
 
-            if old_date and last_expiry:
-                new_date = parse_expiry_date(
-                    last_expiry
+                log(
+                    f"ℹ️ 检测到 Renew 倒计时: "
+                    f"{current_countdown}"
                 )
+
+            # 最可靠的判断：
+            # 新到期日期 > 原到期日期
+            if old_date and current_expiry:
+                new_date = parse_expiry_date(current_expiry)
 
                 if new_date and new_date > old_date:
-                    print(
-                        "✅ 确认续期成功"
+                    log(
+                        f"✅ 确认续期成功: "
+                        f"{old_expiry} -> {current_expiry}"
                     )
 
-                    print(
-                        f"📈 {old_expiry} "
-                        f"→ {last_expiry}"
-                    )
-
-                    return {
-                        "success": True,
-                        "expiry": last_expiry,
-                        "countdown": last_countdown,
-                    }
+                    return True, current_expiry
 
         except Exception as e:
-            print(
-                f"⚠️ 检查续期结果异常: {e}"
-            )
+            log(f"⚠️ 检查续期结果时出错: {e}")
 
-        sb.sleep(2)
+        sb.sleep(3)
 
-    print(
-        "⚠️ 未能在规定时间内确认续期"
-    )
+    log("⚠️ 在规定时间内无法确认续期结果")
 
-    return {
-        "success": False,
-        "expiry": last_expiry,
-        "countdown": last_countdown,
-    }
+    if last_expiry:
+        log(f"📅 当前检测到的到期时间: {last_expiry}")
+
+    if last_countdown:
+        log(f"⏱️ 当前检测到的倒计时: {last_countdown}")
+
+    return False, last_expiry
 
 
 # ============================================================
-# 更新 SESSION_TOKEN
+# Session Token 提取
 # ============================================================
 
-def update_session_token(sb):
-    print(
-        "🔄 检查 SESSION_TOKEN 是否需要更新..."
-    )
-
+def get_session_cookie(sb):
     try:
-        new_token, token_expiry = (
-            get_cookie_info(
-                sb,
-                "session_token",
-            )
-        )
+        cookies = sb.get_cookies()
 
-        if not new_token:
-            print(
-                "⚠️ 页面中没有获取到新的 "
-                "session_token"
-            )
-            return
+        for cookie in cookies:
+            if cookie.get("name") == "session_token":
+                value = cookie.get("value")
 
-        if should_update_cookie(
-            new_token,
-            SESSION_TOKEN,
-            token_expiry,
-        ):
-            print(
-                "🔄 SESSION_TOKEN 发生变化或即将过期"
-            )
-
-            if not GH_TOKEN:
-                print(
-                    "⚠️ 未配置 GH_TOKEN，"
-                    "无法自动更新 GitHub Secret"
-                )
-
-                return
-
-            if update_github_secret(
-                "SESSION_TOKEN",
-                new_token,
-            ):
-                print(
-                    "✅ SESSION_TOKEN 已更新"
-                )
-            else:
-                print(
-                    "❌ SESSION_TOKEN 更新失败"
-                )
-
-        else:
-            print(
-                "✅ SESSION_TOKEN 无需更新"
-            )
+                if value:
+                    return value
 
     except Exception as e:
-        print(
-            f"❌ SESSION_TOKEN 检查异常: {e}"
-        )
+        log(f"⚠️ 获取 Session Cookie 失败: {e}")
+
+    return None
 
 
 # ============================================================
-# 主流程
+# GitHub Secret 更新
+# ============================================================
+
+def update_github_secret(secret_name, new_value):
+    if not GH_TOKEN:
+        log("ℹ️ GH_TOKEN 未配置，跳过 GitHub Secret 更新")
+        return False
+
+    if not new_value:
+        log("⚠️ 新 Session Token 为空，拒绝更新")
+        return False
+
+    env = os.environ.copy()
+    env["GH_TOKEN"] = GH_TOKEN
+
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "secret",
+                "set",
+                secret_name,
+                "--body",
+                new_value,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+
+        if result.returncode == 0:
+            log(f"✅ GitHub Secret 已更新: {secret_name}")
+            return True
+
+        error_text = result.stderr.strip()
+
+        log(
+            f"❌ GitHub Secret 更新失败: "
+            f"{error_text[:500]}"
+        )
+
+        return False
+
+    except FileNotFoundError:
+        log("❌ 找不到 gh 命令，请确认 GitHub CLI 已安装")
+        return False
+
+    except Exception as e:
+        log(f"❌ 更新 GitHub Secret 异常: {e}")
+        return False
+
+
+# ============================================================
+# Session Token 更新逻辑
+# ============================================================
+
+def update_session_token(sb, current_expiry):
+    new_token = get_session_cookie(sb)
+
+    if not new_token:
+        log("⚠️ 页面没有获取到新的 session_token")
+        return False
+
+    if not SESSION_TOKEN:
+        log("ℹ️ 当前没有旧 SESSION_TOKEN")
+        return update_github_secret(
+            SESSION_SECRET_NAME,
+            new_token,
+        )
+
+    if new_token != SESSION_TOKEN:
+        log("🔄 检测到新的 Session Token")
+        return update_github_secret(
+            SESSION_SECRET_NAME,
+            new_token,
+        )
+
+    expiry_date = parse_expiry_date(current_expiry)
+
+    if expiry_date:
+        today = datetime.now(UTC8).date()
+        remaining_days = (expiry_date - today).days
+
+        log(f"📅 Session 到期剩余约 {remaining_days} 天")
+
+        if remaining_days <= 3:
+            log("🔄 Session 即将到期，重新写入 GitHub Secret")
+
+            return update_github_secret(
+                SESSION_SECRET_NAME,
+                new_token,
+            )
+
+    log("ℹ️ Session Token 没有变化，无需更新")
+
+    return True
+
+
+# ============================================================
+# 主程序
 # ============================================================
 
 def main():
+    log("=" * 60)
+    log("🇫🇮 Bot-hosting 自动续期程序启动")
+    log("=" * 60)
 
-    print("=" * 50)
-    print("       Bot-hosting 自动续期")
-    print("=" * 50)
+    if not SESSION_TOKEN:
+        log("❌ SESSION_TOKEN 未配置")
+        send_telegram_message(
+            format_notification(
+                "❌ 自动续期失败",
+                error="SESSION_TOKEN 未配置",
+            )
+        )
+        return 1
 
-    print(
-        f"🕐 当前时间: {now_string()}"
-    )
+    log(f"👤 账户: {mask_email(EMAIL)}")
+    log(f"🌐 当前 IP: {get_current_ip()}")
+    log(f"🖥️ Headless: {HEADLESS}")
+    log(f"🔀 Proxy: {IS_PROXY}")
 
-    # --------------------------------------------------------
-    # SeleniumBase
-    # --------------------------------------------------------
+    proxy = None
+
+    if IS_PROXY:
+        if PROXY_SERVER:
+            proxy = PROXY_SERVER
+            log(f"🔀 使用代理: {proxy}")
+        else:
+            log("⚠️ IS_PROXY=true，但 PROXY_SERVER 为空")
 
     sb_kwargs = {
         "uc": True,
         "headless": HEADLESS,
     }
 
-    if IS_PROXY:
-        print(
-            f"🔗 使用代理: {PROXY_SERVER}"
-        )
+    if proxy:
+        sb_kwargs["proxy"] = proxy
 
-        sb_kwargs["proxy"] = PROXY_SERVER
+    current_expiry = None
 
-    else:
-        print("🍭 未使用代理，直连访问")
+    try:
+        with SB(**sb_kwargs) as sb:
+            log("🌐 浏览器启动成功")
 
-    # --------------------------------------------------------
-    # 浏览器
-    # --------------------------------------------------------
+            # ------------------------------------------------
+            # 注入 Session
+            # ------------------------------------------------
 
-    with SB(**sb_kwargs) as sb:
-
-        # ----------------------------------------------------
-        # IP
-        # ----------------------------------------------------
-
-        try:
-            ip = get_current_ip(
-                PROXY_SERVER
-                if IS_PROXY
-                else ""
-            )
-
-            print(
-                f"📍 当前出口 IP: {ip}"
-            )
-
-        except Exception as e:
-            print(
-                f"⚠️ 获取出口 IP 失败: {e}"
-            )
-
-        # ----------------------------------------------------
-        # 登录
-        # ----------------------------------------------------
-
-        login_ok = login_with_session(sb)
-
-        if not login_ok:
-
-            send_telegram_message(
-                format_notification(
-                    "❌ 登录失败",
-                    error=(
-                        "SESSION_TOKEN 无效、"
-                        "已过期或页面异常"
-                    ),
+            if not inject_session_cookie(sb):
+                send_telegram_message(
+                    format_notification(
+                        "❌ 自动续期失败",
+                        error="Session Cookie 注入失败",
+                    )
                 )
-            )
+                return 1
 
-            return
+            # ------------------------------------------------
+            # 登录
+            # ------------------------------------------------
 
-        # ----------------------------------------------------
-        # 获取当前页面
-        # ----------------------------------------------------
-
-        print("🔎 获取当前账户状态...")
-
-        sb.sleep(2)
-
-        page_source = (
-            sb.get_page_source()
-        )
-
-        current_expiry = (
-            extract_expiry_date(
-                page_source
-            )
-        )
-
-        current_countdown = (
-            extract_countdown(
-                page_source
-            )
-        )
-
-        if current_expiry:
-            print(
-                f"📅 当前到期日期: "
-                f"{current_expiry}"
-            )
-        else:
-            print(
-                "⚠️ 未能读取当前到期日期"
-            )
-
-        if current_countdown:
-            print(
-                f"⏱️ 当前倒计时: "
-                f"{current_countdown}"
-            )
-
-        # ----------------------------------------------------
-        # 找 Renew
-        # ----------------------------------------------------
-
-        print("🔎 查找 Renew 控件...")
-
-        renew_selector, countdown = (
-            find_renew_control(sb)
-        )
-
-        # ----------------------------------------------------
-        # 尚未到续期时间
-        # ----------------------------------------------------
-
-        if not renew_selector:
-
-            if countdown:
-
-                friendly = format_countdown(
-                    countdown
-                )
-
-                print(
-                    f"⏳ 尚未到续期时间: "
-                    f"{countdown}"
-                )
+            if not login_with_session(sb):
+                log("❌ Session 登录失败")
 
                 send_telegram_message(
                     format_notification(
-                        "⏳ 未到续期时间",
-                        extra=(
-                            f"⏱️ 可续期时间: "
-                            f"{friendly} 后"
-                        ),
-                        expiry_date=(
-                            current_expiry
-                            or "（未获取到）"
+                        "❌ 自动续期失败",
+                        error="Session 登录失败，请检查 SESSION_TOKEN",
+                    )
+                )
+
+                return 1
+
+            # ------------------------------------------------
+            # 获取当前到期时间
+            # ------------------------------------------------
+
+            try:
+                page_source = sb.get_page_source()
+
+                current_expiry = extract_expiry_date(
+                    page_source
+                )
+
+            except Exception as e:
+                log(f"⚠️ 获取到期时间失败: {e}")
+
+            if current_expiry:
+                log(f"📅 当前到期时间: {current_expiry}")
+            else:
+                log("⚠️ 无法识别当前到期时间")
+
+            # ------------------------------------------------
+            # 查找 Renew
+            # ------------------------------------------------
+
+            renew_selector = find_renew_control(sb)
+
+            if not renew_selector:
+                diagnostic = get_page_diagnostic(sb)
+
+                if diagnostic:
+                    log(
+                        "📄 页面诊断:\n"
+                        + diagnostic[:1000]
+                    )
+
+                send_telegram_message(
+                    format_notification(
+                        "⚠️ 暂未找到续期按钮",
+                        expiry_date=current_expiry or "未知",
+                        error="页面可能尚未到续期时间，或页面结构发生变化",
+                    )
+                )
+
+                # 即使没有续期按钮，也尝试更新 Session
+                update_session_token(
+                    sb,
+                    current_expiry,
+                )
+
+                return 0
+
+            # ------------------------------------------------
+            # 检查是否处于倒计时
+            # ------------------------------------------------
+
+            try:
+                source = sb.get_page_source()
+                countdown = extract_countdown(source)
+
+                if countdown:
+                    log(f"⏱️ 当前不能立即续期，倒计时: {countdown}")
+
+                    send_telegram_message(
+                        format_notification(
+                            "⏳ 暂未到续期时间",
+                            expiry_date=current_expiry or "未知",
+                            extra=f"⏱️ Renew in {countdown}",
+                        )
+                    )
+
+                    update_session_token(
+                        sb,
+                        current_expiry,
+                    )
+
+                    return 0
+
+            except Exception:
+                pass
+
+            # ------------------------------------------------
+            # 点击外部续期
+            # ------------------------------------------------
+
+            if not click_outer_renew(
+                sb,
+                renew_selector,
+            ):
+                send_telegram_message(
+                    format_notification(
+                        "❌ 续期失败",
+                        expiry_date=current_expiry or "未知",
+                        error="无法点击 Renew 控件",
+                    )
+                )
+                return 1
+
+            # ------------------------------------------------
+            # 等待页面验证
+            # ------------------------------------------------
+
+            if not wait_for_verification(
+                sb,
+                timeout=120,
+            ):
+                diagnostic = get_page_diagnostic(sb)
+
+                send_telegram_message(
+                    format_notification(
+                        "⚠️ 续期结果无法确认",
+                        expiry_date=current_expiry or "未知",
+                        error=(
+                            "页面验证等待超时。"
+                            f" 页面信息: {diagnostic[:300]}"
                         ),
                     )
                 )
+
+                return 1
+
+            # ------------------------------------------------
+            # 点击最终 Renew
+            # ------------------------------------------------
+
+            if not click_final_renew(sb):
+                diagnostic = get_page_diagnostic(sb)
+
+                send_telegram_message(
+                    format_notification(
+                        "❌ 续期失败",
+                        expiry_date=current_expiry or "未知",
+                        error=(
+                            "找不到最终 Renew for 4 days 按钮。"
+                            f" 页面: {diagnostic[:300]}"
+                        ),
+                    )
+                )
+
+                return 1
+
+            # ------------------------------------------------
+            # 验证结果
+            # ------------------------------------------------
+
+            renewed, new_expiry = verify_renewal(
+                sb,
+                current_expiry,
+                timeout=45,
+            )
+
+            if renewed:
+                log("🎉 续期成功")
+
+                send_telegram_message(
+                    format_notification(
+                        "✅ 续期成功",
+                        expiry_date=new_expiry,
+                        extra=(
+                            f"📈 到期时间: "
+                            f"{current_expiry or '未知'} → {new_expiry}"
+                        ),
+                    )
+                )
+
+                current_expiry = new_expiry
 
             else:
+                diagnostic = get_page_diagnostic(sb)
 
-                diagnostic = (
-                    get_page_diagnostic(
-                        sb
-                    )
-                )
-
-                print(
-                    "⚠️ 未找到 Renew "
-                    "或倒计时"
-                )
+                log("⚠️ 无法确认续期成功")
 
                 send_telegram_message(
                     format_notification(
-                        "⚠️ 无法确认续期状态",
-                        extra=(
-                            "未找到 Renew 按钮"
-                        ),
-                        expiry_date=(
-                            current_expiry
-                            or "（未获取到）"
-                        ),
+                        "⚠️ 续期可能未成功",
+                        expiry_date=new_expiry or current_expiry or "未知",
                         error=(
-                            diagnostic
-                            or "页面无可用诊断信息"
+                            "页面在等待时间内没有确认到期日期变化。"
+                            f" 页面: {diagnostic[:500]}"
                         ),
                     )
                 )
 
-            update_session_token(sb)
+            # ------------------------------------------------
+            # 更新 Session Token
+            # ------------------------------------------------
 
-            print("🏁 脚本执行完毕")
-            return
+            update_session_token(
+                sb,
+                current_expiry,
+            )
 
-        # ----------------------------------------------------
-        # 可以续期
-        # ----------------------------------------------------
+            log("=" * 60)
+            log("🏁 脚本执行完毕")
+            log("=" * 60)
 
-        print(
-            f"✅ 找到可用 Renew 控件: "
-            f"{renew_selector}"
+            return 0
+
+    except Exception as e:
+        log("=" * 60)
+        log(f"💥 程序发生未处理异常: {e}")
+        log("=" * 60)
+
+        send_telegram_message(
+            format_notification(
+                "❌ 自动续期程序异常",
+                expiry_date=current_expiry or "未知",
+                error=str(e)[:500],
+            )
         )
 
-        if not current_expiry:
-            print(
-                "⚠️ 无法读取续期前日期，"
-                "仍会尝试续期，但成功确认能力降低"
-            )
+        return 1
 
-        # ----------------------------------------------------
-        # 点击外部 Renew
-        # ----------------------------------------------------
-
-        if not click_outer_renew(
-            sb,
-            renew_selector,
-        ):
-
-            send_telegram_message(
-                format_notification(
-                    "❌ 续期失败",
-                    error=(
-                        "无法点击外部 Renew 按钮"
-                    ),
-                    expiry_date=(
-                        current_expiry
-                        or "（未获取到）"
-                    ),
-                )
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # 验证
-        # ----------------------------------------------------
-
-        if not wait_for_verification(
-            sb,
-            timeout=120,
-        ):
-
-            diagnostic = (
-                get_page_diagnostic(sb)
-            )
-
-            send_telegram_message(
-                format_notification(
-                    "❌ 续期失败",
-                    error=(
-                        "验证页面在规定时间内"
-                        "没有完成"
-                        + (
-                            f"\n页面: {diagnostic}"
-                            if diagnostic
-                            else ""
-                        )
-                    ),
-                    expiry_date=(
-                        current_expiry
-                        or "（未获取到）"
-                    ),
-                )
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # 点击最终 Renew
-        # ----------------------------------------------------
-
-        print(
-            "🔎 查找最终续期按钮..."
-        )
-
-        if not click_final_renew(sb):
-
-            diagnostic = (
-                get_page_diagnostic(sb)
-            )
-
-            send_telegram_message(
-                format_notification(
-                    "❌ 续期失败",
-                    error=(
-                        "找不到或无法点击 "
-                        "Renew for 4 days"
-                        + (
-                            f"\n页面: {diagnostic}"
-                            if diagnostic
-                            else ""
-                        )
-                    ),
-                    expiry_date=(
-                        current_expiry
-                        or "（未获取到）"
-                    ),
-                )
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # 确认续期
-        # ----------------------------------------------------
-
-        result = verify_renewal(
-            sb,
-            current_expiry,
-            timeout=45,
-        )
-
-        new_expiry = result.get(
-            "expiry"
-        )
-
-        new_countdown = result.get(
-            "countdown"
-        )
-
-        # ----------------------------------------------------
-        # 成功
-        # ----------------------------------------------------
-
-        if result.get("success"):
-
-            extra = "📈 到期日期已确认延长"
-
-            if current_expiry and new_expiry:
-                extra = (
-                    f"📈 到期日期: "
-                    f"{current_expiry} → "
-                    f"{new_expiry}"
-                )
-
-            if new_countdown:
-                extra += (
-                    f"\n⏱️ 下次可续期: "
-                    f"{format_countdown(new_countdown)} 后"
-                )
-
-            send_telegram_message(
-                format_notification(
-                    "✅ 续期成功",
-                    extra=extra,
-                    expiry_date=(
-                        new_expiry
-                        or "（未获取到）"
-                    ),
-                )
-            )
-
-        # ----------------------------------------------------
-        # 无法确认
-        # ----------------------------------------------------
-
-        else:
-
-            diagnostic = (
-                get_page_diagnostic(sb)
-            )
-
-            extra = (
-                "没有检测到明确的"
-                "到期日期变化"
-            )
-
-            if new_countdown:
-                extra += (
-                    f"\n⏱️ 页面当前倒计时: "
-                    f"{format_countdown(new_countdown)}"
-                )
-
-            send_telegram_message(
-                format_notification(
-                    "⚠️ 续期结果无法确认",
-                    extra=extra,
-                    error=(
-                        diagnostic
-                        or "页面没有返回明确结果"
-                    ),
-                    expiry_date=(
-                        new_expiry
-                        or current_expiry
-                        or "（未获取到）"
-                    ),
-                )
-            )
-
-        # ----------------------------------------------------
-        # SESSION_TOKEN
-        # ----------------------------------------------------
-
-        update_session_token(sb)
-
-        print("=" * 50)
-        print("🏁 脚本执行完毕")
-        print("=" * 50)
-
-
-# ============================================================
-# Entry
-# ============================================================
 
 if __name__ == "__main__":
-    main()
-```
+    raise SystemExit(main())
